@@ -121,9 +121,13 @@ def sync_receipts(store: GuardStore) -> dict[str, object]:
     alert_preferences = payload.get("alertPreferences")
     if isinstance(alert_preferences, dict):
         store.set_sync_payload("alert_preferences", alert_preferences, now)
+    else:
+        store.set_sync_payload("alert_preferences", {}, now)
     team_policy_pack = payload.get("teamPolicyPack")
     if isinstance(team_policy_pack, dict):
         store.set_sync_payload("team_policy_pack", team_policy_pack, now)
+    else:
+        store.set_sync_payload("team_policy_pack", {}, now)
     exceptions = payload.get("exceptions")
     remote_decisions = _build_remote_policy_decisions(payload)
     store.replace_remote_policies(remote_decisions, now)

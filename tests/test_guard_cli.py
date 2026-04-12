@@ -16,6 +16,7 @@ from codex_plugin_scanner.cli import main
 from codex_plugin_scanner.guard.adapters import cursor as cursor_adapter_module
 from codex_plugin_scanner.guard.cli import commands as guard_commands_module
 from codex_plugin_scanner.guard.cli.render import emit_guard_payload
+from codex_plugin_scanner.guard.store import GuardStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -1556,6 +1557,14 @@ args = ["workspace-skill.js", "--changed"]
                 "unknownPublisherAction": "review",
                 "changedHashAction": "require-reapproval",
             },
+            "alertPreferences": {
+                "emailEnabled": True,
+                "digestMode": "daily",
+            },
+            "teamPolicyPack": {
+                "name": "Security team default",
+                "allowedPublishers": ["hashgraph-online"],
+            },
         }
 
         server = HTTPServer(("127.0.0.1", 0), _SyncRequestHandler)
@@ -1596,12 +1605,16 @@ args = ["workspace-skill.js", "--changed"]
 
         policy_rc = main(["guard", "policies", "--home", str(home_dir), "--json"])
         policy_output = json.loads(capsys.readouterr().out)
+        store = GuardStore(home_dir)
 
         assert login_rc == 0
         assert first_sync_rc == 0
         assert second_sync_rc == 0
         assert policy_rc == 0
         assert not any(item["source"] == "cloud-sync" for item in policy_output["items"])
+        assert store.get_sync_payload("policy") == {}
+        assert store.get_sync_payload("alert_preferences") == {}
+        assert store.get_sync_payload("team_policy_pack") == {}
 
     def test_guard_run_auto_syncs_cloud_policy_bundle(self, tmp_path, capsys):
         home_dir = tmp_path / "home"
