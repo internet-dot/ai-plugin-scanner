@@ -116,6 +116,8 @@ def sync_receipts(store: GuardStore) -> dict[str, object]:
     policy = payload.get("policy")
     if isinstance(policy, dict):
         store.set_sync_payload("policy", policy, now)
+    else:
+        store.set_sync_payload("policy", {}, now)
     alert_preferences = payload.get("alertPreferences")
     if isinstance(alert_preferences, dict):
         store.set_sync_payload("alert_preferences", alert_preferences, now)
