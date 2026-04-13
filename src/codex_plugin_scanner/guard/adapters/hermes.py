@@ -169,7 +169,11 @@ class HermesHarnessAdapter(HarnessAdapter):
             subdir = skill_dir / subdir_name
             if not subdir.is_dir():
                 continue
-            for file_path in sorted(subdir.rglob("*")):
+            try:
+                sub_files = sorted(subdir.rglob("*"))
+            except (PermissionError, OSError):
+                continue
+            for file_path in sub_files:
                 if not file_path.is_file():
                     continue
                 if not _is_scannable(file_path):
