@@ -6,6 +6,7 @@ configured in ~/.hermes/config.yaml or ~/.hermes/mcp_servers.json.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import re
@@ -565,6 +566,10 @@ def _parse_mcp_yaml_fallback(yaml_path: Path) -> dict[str, dict[str, object]]:
     # Track block-style args list (args:\n  - value1\n  - value2).
     in_args_block = False
     args_indent = 0
+    # Track multiline scalar args (- | or - >)
+    multiline_continue = False
+    multiline_buffer = ""
+    multiline_start_indent = 0
 
     for line in lines:
         stripped = line.lstrip()
@@ -630,6 +635,13 @@ def _parse_mcp_yaml_fallback(yaml_path: Path) -> dict[str, dict[str, object]]:
 
         # Inside a block-style args list (  - value1).
         if in_args_block and indent > args_indent and stripped.startswith("- "):
+            # Check for multiline scalar indicator (- | or - >)
+            if stripped[2:].strip() in ("|", ">"):
+                # Start collecting multiline content
+                multiline_start_indent = indent + 2
+                multiline_continue = True
+                multiline_buffer = ""
+                continue
             arg_val = _unquote(stripped[2:].strip())
             servers[current_server].setdefault("args", []).append(arg_val)
             continue
@@ -653,8 +665,25 @@ def _parse_mcp_yaml_fallback(yaml_path: Path) -> dict[str, dict[str, object]]:
         if in_args_block and indent <= args_indent:
             in_args_block = False
 
+        # Handle multiline scalar args continuation (- | or - >)
+        if multiline_continue:
+            if indent < multiline_start_indent or (not stripped and indent == 0):
+                # Multiline block ended - save collected content
+                if multiline_buffer and current_server:
+                    servers[current_server].setdefault("args", []).append(multiline_buffer.strip())
+                multiline_continue = False
+                multiline_buffer = ""
+            else:
+                # Collect continuation line
+                multiline_buffer += stripped + "\n"
+            continue
+
         # Top-level server property.
         _parse_yaml_property(stripped, servers[current_server])
+
+    # Flush any remaining multiline buffer
+    if multiline_continue and multiline_buffer and current_server:
+        servers[current_server].setdefault("args", []).append(multiline_buffer.strip())
 
     return servers
 
@@ -679,13 +708,29 @@ def _parse_yaml_property(line: str, target: dict[str, object]) -> None:
             target[key] = True
         else:
             target[key] = _unquote(bare_value)
-    elif key == "args" and value.startswith("["):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                target[key] = parsed
-        except json.JSONDecodeError:
-            pass
+    elif key in ("env", "headers"):
+        # Handle inline map syntax: env: {KEY: value}
+        inline_match = re.match(r"^\{(.+)\}$", value)
+        if inline_match:
+            try:
+                # Parse as Python dict literal (YAML keys are unquoted by this point)
+                parsed = ast.literal_eval("{" + inline_match.group(1) + "}")
+                if isinstance(parsed, dict):
+                    target[key] = parsed
+            except (ValueError, SyntaxError):
+                pass
+    elif key == "args":
+        # Handle JSON array: args: [value1, value2]
+        if value.startswith("["):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    target[key] = parsed
+            except json.JSONDecodeError:
+                pass
+        # Handle single quoted string: args: 'value' (fallback for simple cases)
+        elif value.startswith("'") or value.startswith('"'):
+            target[key] = [_unquote(value)]
 
 
 def _parse_mcp_from_json(json_path: Path) -> dict[str, dict[str, object]]:
