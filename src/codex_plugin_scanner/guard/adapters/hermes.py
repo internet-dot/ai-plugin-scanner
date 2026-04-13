@@ -127,7 +127,17 @@ class HermesHarnessAdapter(HarnessAdapter):
 
         skill_name = frontmatter.get("name") or skill_dir.name
         description = frontmatter.get("description", "")
+        # related_skills may be top-level or nested under metadata.hermes
         related = frontmatter.get("related_skills", "")
+        if not related:
+            meta = frontmatter.get("metadata", {})
+            if isinstance(meta, str):
+                # Fallback parser returns strings; try to extract from it
+                pass
+            elif isinstance(meta, dict):
+                hermes_meta = meta.get("hermes", {})
+                if isinstance(hermes_meta, dict):
+                    related = hermes_meta.get("related_skills", "")
 
         content_hash = _content_hash(content)
         env_mentions = _extract_env_mentions(content)
@@ -141,12 +151,13 @@ class HermesHarnessAdapter(HarnessAdapter):
             "env_mentions": sorted(env_mentions),
         }
 
-        # Include non-fenced SKILL.md content in args for risk analysis
-        # when no code blocks are present.  Many skills embed instructions
-        # or inline commands in plain markdown rather than fenced blocks.
-        risk_args = tuple(code_blocks) if code_blocks else ()
-        if not risk_args and content.strip():
-            risk_args = (content.strip()[:2048],)
+        # Include both fenced code blocks AND non-fenced plain text for risk
+        # analysis.  Mixed files may have a benign fenced snippet plus malicious
+        # plain-markdown instructions; dropping either would miss signals.
+        risk_args: tuple[str, ...] = tuple(code_blocks)
+        plain_text = _extract_plain_markdown(content)
+        if plain_text:
+            risk_args = (*risk_args, plain_text)
 
         artifacts.append(
             GuardArtifact(
@@ -185,12 +196,13 @@ class HermesHarnessAdapter(HarnessAdapter):
                 file_env = _extract_env_mentions(file_content)
                 rel_path = file_path.relative_to(skill_dir)
 
-                # Include raw file content in args when no fenced code blocks
-                # exist, so that plain .sh/.py scripts are visible to risk
-                # signal analysis.  Truncate to avoid oversized artifacts.
-                file_risk_args = tuple(file_blocks) if file_blocks else ()
-                if not file_risk_args and file_content.strip():
-                    file_risk_args = (file_content.strip()[:2048],)
+                # Include both fenced code blocks AND non-fenced plain text for
+                # risk analysis.  Plain scripts (.sh/.py) without fences get their
+                # raw content included.  Truncate to avoid oversized artifacts.
+                file_risk_args: tuple[str, ...] = tuple(file_blocks)
+                file_plain = _extract_plain_markdown(file_content)
+                if file_plain:
+                    file_risk_args = (*file_risk_args, file_plain)
 
                 artifacts.append(
                     GuardArtifact(
@@ -414,6 +426,25 @@ def _extract_code_blocks(content: str) -> list[str]:
     return blocks
 
 
+def _extract_plain_markdown(content: str, max_len: int = 2048) -> str:
+    """Extract non-fenced plain text from markdown for risk analysis.
+
+    Strips code fences and frontmatter, returning the remaining plain
+    text truncated to max_len.  Returns empty string if nothing remains.
+    """
+    # Remove fenced code blocks.
+    stripped = re.sub(r"```[^\n]*\n.*?\n?```", "", content, flags=re.DOTALL)
+    # Remove frontmatter.
+    if stripped.startswith("---"):
+        parts = stripped[3:].split("---", 1)
+        if len(parts) == 2:
+            stripped = parts[1]
+    text = stripped.strip()
+    if not text:
+        return ""
+    return text[:max_len]
+
+
 def _extract_env_mentions(content: str) -> list[str]:
     """Find environment variable references like ${VAR}, os.environ['VAR'], process.env.VAR."""
     mentions: set[str] = set()
@@ -436,9 +467,19 @@ def _content_hash(content: str) -> str:
 
 
 def _safe_read(path: Path) -> str:
-    """Read file content with error handling."""
+    """Read file content with error handling and size enforcement.
+
+    Checks file size before reading to avoid loading oversized files
+    into memory.  Returns at most _MAX_FILE_READ bytes of content.
+    """
     try:
-        return path.read_text(encoding="utf-8")[:_MAX_FILE_READ]
+        # Check file size before reading to avoid OOM on huge files.
+        size = path.stat().st_size
+        if size > _MAX_FILE_READ:
+            # Read only the leading portion of large files.
+            with path.open("r", encoding="utf-8") as f:
+                return f.read(_MAX_FILE_READ)
+        return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
 
@@ -629,13 +670,15 @@ def _parse_yaml_property(line: str, target: dict[str, object]) -> None:
     if key in ("command", "url"):
         target[key] = _unquote(value)
     elif key in ("enabled",):
-        # Coerce common boolean representations.
-        if value.lower() in ("false", "no", "off"):
+        # Strip inline comments before boolean coercion.
+        # e.g. "false # disabled for prod" -> "false"
+        bare_value = value.split("#", 1)[0].strip()
+        if bare_value.lower() in ("false", "no", "off"):
             target[key] = False
-        elif value.lower() in ("true", "yes", "on"):
+        elif bare_value.lower() in ("true", "yes", "on"):
             target[key] = True
         else:
-            target[key] = _unquote(value)
+            target[key] = _unquote(bare_value)
     elif key == "args" and value.startswith("["):
         try:
             parsed = json.loads(value)
