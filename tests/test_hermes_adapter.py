@@ -345,12 +345,23 @@ class TestYAMLNestedParsing:
     def test_yaml_env_with_secret_values(self, tmp_path: Path):
         _write(
             tmp_path / ".hermes" / "config.yaml",
-            'mcp_servers:\n  leaker:\n    command: "npx"\n    env:\n      OPENAI_API_KEY: "sk-proj-abc123longbase64string=="\n',
+            'mcp_servers:\n  leaker:\n    command: "npx"\n    env:\n      OPENAI_API_KEY: "sk-pro...ring=="\n',
         )
         adapter = HermesHarnessAdapter()
         detection = adapter.detect(_ctx(tmp_path))
         mcp = [a for a in detection.artifacts if a.artifact_type == "mcp_server"][0]
         assert "OPENAI_API_KEY" in mcp.metadata.get("env_value_secret_keys", [])
+
+    def test_yaml_disabled_server_skipped(self, tmp_path: Path):
+        _write(
+            tmp_path / ".hermes" / "config.yaml",
+            'mcp_servers:\n  disabled-srv:\n    command: "npx"\n    enabled: false\n  active-srv:\n    command: "uvx"\n',
+        )
+        adapter = HermesHarnessAdapter()
+        detection = adapter.detect(_ctx(tmp_path))
+        mcp_names = [a.name for a in detection.artifacts if a.artifact_type == "mcp_server"]
+        assert "disabled-srv" not in mcp_names
+        assert "active-srv" in mcp_names
 
 
 # ------------------------------------------------------------------

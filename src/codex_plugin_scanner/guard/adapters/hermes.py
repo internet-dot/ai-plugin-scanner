@@ -628,6 +628,14 @@ def _parse_yaml_property(line: str, target: dict[str, object]) -> None:
 
     if key in ("command", "url"):
         target[key] = _unquote(value)
+    elif key in ("enabled",):
+        # Coerce common boolean representations.
+        if value.lower() in ("false", "no", "off"):
+            target[key] = False
+        elif value.lower() in ("true", "yes", "on"):
+            target[key] = True
+        else:
+            target[key] = _unquote(value)
     elif key == "args" and value.startswith("["):
         try:
             parsed = json.loads(value)
