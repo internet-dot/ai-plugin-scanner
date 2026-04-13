@@ -14,6 +14,16 @@ from pathlib import Path
 from ..models import GuardArtifact, HarnessDetection
 from .base import HarnessAdapter, HarnessContext, _command_available, _json_payload
 
+# Optional: PyYAML is preferred when available for robust YAML parsing.
+# The adapter works without it via a line-based fallback parser.
+try:
+    import yaml as _yaml  # type: ignore[import-untyped]
+
+    _HAS_PYYAML = True
+except ImportError:
+    _yaml = None  # type: ignore[assignment]
+    _HAS_PYYAML = False
+
 # Subdirectories within a skill that may contain executable or injectable content.
 _SKILL_SUBDIRS = ("references", "templates", "scripts", "assets")
 
@@ -312,15 +322,14 @@ def _parse_frontmatter(content: str) -> dict[str, object]:
     raw = parts[0].strip()
 
     # Try PyYAML first for robust nested-structure support.
-    try:
-        import yaml  # noqa: F811
-
-        parsed = yaml.safe_load(raw)
-        if isinstance(parsed, dict):
-            # Flatten values to strings for consistent downstream handling.
-            return {k: _flatten_yaml_value(v) for k, v in parsed.items()}
-    except (ImportError, Exception):  # noqa: BLE001
-        pass
+    if _HAS_PYYAML:
+        try:
+            parsed = _yaml.safe_load(raw)  # type: ignore[union-attr]
+            if isinstance(parsed, dict):
+                # Flatten values to strings for consistent downstream handling.
+                return {k: _flatten_yaml_value(v) for k, v in parsed.items()}
+        except Exception:
+            pass
 
     # Fallback: simple line-based parser for top-level keys only.
     frontmatter: dict[str, object] = {}
@@ -421,26 +430,25 @@ def _parse_mcp_from_yaml(yaml_path: Path) -> dict[str, dict[str, object]]:
     blocks by tracking nesting depth.
     """
     # Try PyYAML first for robust parsing.
-    try:
-        import yaml  # noqa: F811
-
-        content = _safe_read(yaml_path)
-        if not content:
-            return {}
-        parsed = yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            return {}
-        mcp = parsed.get("mcp_servers")
-        if not isinstance(mcp, dict):
-            return {}
-        # Normalise to plain dicts with string keys.
-        servers: dict[str, dict[str, object]] = {}
-        for name, config in mcp.items():
-            if isinstance(name, str) and isinstance(config, dict):
-                servers[name] = config
-        return servers
-    except (ImportError, Exception):  # noqa: BLE001
-        pass
+    if _HAS_PYYAML:
+        try:
+            content = _safe_read(yaml_path)
+            if not content:
+                return {}
+            parsed = _yaml.safe_load(content)  # type: ignore[union-attr]
+            if not isinstance(parsed, dict):
+                return {}
+            mcp = parsed.get("mcp_servers")
+            if not isinstance(mcp, dict):
+                return {}
+            # Normalise to plain dicts with string keys.
+            servers: dict[str, dict[str, object]] = {}
+            for name, config in mcp.items():
+                if isinstance(name, str) and isinstance(config, dict):
+                    servers[name] = config
+            return servers
+        except Exception:
+            pass
 
     # Fallback: indent-aware line-based parser.
     return _parse_mcp_yaml_fallback(yaml_path)
