@@ -138,6 +138,14 @@ class HermesHarnessAdapter(HarnessAdapter):
                 file_blocks = _extract_code_blocks(file_content)
                 file_env = _extract_env_mentions(file_content)
                 rel_path = file_path.relative_to(skill_dir)
+
+                # Include raw file content in args when no fenced code blocks
+                # exist, so that plain .sh/.py scripts are visible to risk
+                # signal analysis.  Truncate to avoid oversized artifacts.
+                risk_args = tuple(file_blocks) if file_blocks else ()
+                if not risk_args and file_content.strip():
+                    risk_args = (file_content.strip()[:2048],)
+
                 artifacts.append(
                     GuardArtifact(
                         artifact_id=(
@@ -152,7 +160,7 @@ class HermesHarnessAdapter(HarnessAdapter):
                         command=str(file_path),
                         url=None,
                         transport=None,
-                        args=tuple(file_blocks) if file_blocks else (),
+                        args=risk_args,
                         metadata={
                             "parent_skill": skill_name,
                             "subdir": subdir_name,
@@ -180,19 +188,27 @@ class HermesHarnessAdapter(HarnessAdapter):
         if yaml_path.is_file():
             found_paths.append(str(yaml_path))
             yaml_servers = _parse_mcp_from_yaml(yaml_path)
-            artifacts.extend(self._mcp_artifacts(yaml_servers, str(yaml_path)))
+            artifacts.extend(
+                self._mcp_artifacts(yaml_servers, str(yaml_path), source="yaml")
+            )
 
         # Source 2: mcp_servers.json (legacy / alternative).
         json_path = hermes_home / "mcp_servers.json"
         if json_path.is_file():
             found_paths.append(str(json_path))
             json_servers = _parse_mcp_from_json(json_path)
-            artifacts.extend(self._mcp_artifacts(json_servers, str(json_path)))
+            artifacts.extend(
+                self._mcp_artifacts(json_servers, str(json_path), source="json")
+            )
 
         return artifacts
 
     def _mcp_artifacts(
-        self, servers: dict[str, dict[str, object]], config_path: str,
+        self,
+        servers: dict[str, dict[str, object]],
+        config_path: str,
+        *,
+        source: str,
     ) -> list[GuardArtifact]:
         """Convert parsed MCP server dicts into GuardArtifacts."""
         artifacts: list[GuardArtifact] = []
@@ -232,6 +248,7 @@ class HermesHarnessAdapter(HarnessAdapter):
                 sampling_model = sampling.get("model")
 
             metadata: dict[str, object] = {
+                "source": source,
                 "env_keys": sorted(env.keys()),
                 "header_keys": sorted(header_keys),
                 "auth_header_keys": sorted(auth_header_keys),
@@ -255,9 +272,11 @@ class HermesHarnessAdapter(HarnessAdapter):
             if header_value_hints:
                 metadata["header_value_secret_keys"] = sorted(header_value_hints)
 
+            # Include source in artifact_id to prevent collisions when the
+            # same server name appears in both config.yaml and mcp_servers.json.
             artifacts.append(
                 GuardArtifact(
-                    artifact_id=f"hermes:mcp:{name}",
+                    artifact_id=f"hermes:mcp:{source}:{name}",
                     name=name,
                     harness=self.harness,
                     artifact_type="mcp_server",
@@ -280,19 +299,48 @@ class HermesHarnessAdapter(HarnessAdapter):
 
 
 def _parse_frontmatter(content: str) -> dict[str, object]:
-    """Parse YAML frontmatter from SKILL.md content."""
+    """Parse YAML frontmatter from SKILL.md content.
+
+    Prefers PyYAML when available for correct nested-structure handling.
+    Falls back to a simple line-based parser that extracts top-level keys.
+    """
     if not content.startswith("---"):
         return {}
     parts = content[3:].split("---", 1)
     if len(parts) != 2:
         return {}
+    raw = parts[0].strip()
+
+    # Try PyYAML first for robust nested-structure support.
+    try:
+        import yaml  # noqa: F811
+
+        parsed = yaml.safe_load(raw)
+        if isinstance(parsed, dict):
+            # Flatten values to strings for consistent downstream handling.
+            return {k: _flatten_yaml_value(v) for k, v in parsed.items()}
+    except (ImportError, Exception):  # noqa: BLE001
+        pass
+
+    # Fallback: simple line-based parser for top-level keys only.
     frontmatter: dict[str, object] = {}
-    for line in parts[0].strip().split("\n"):
+    for line in raw.split("\n"):
         if not line or ":" not in line:
             continue
         key, _, value = line.partition(":")
         frontmatter[key.strip()] = value.strip()
     return frontmatter
+
+
+def _flatten_yaml_value(value: object) -> str:
+    """Convert a parsed YAML value to a flat string for frontmatter metadata."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return str(value)
+    return str(value)
 
 
 def _extract_code_blocks(content: str) -> list[str]:
@@ -311,10 +359,12 @@ def _extract_env_mentions(content: str) -> list[str]:
     mentions: set[str] = set()
     for m in re.finditer(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", content):
         mentions.add(m.group(1))
+    # os.environ.get('VAR') and os.getenv('VAR')
     for m in re.finditer(
-        r"os\.environ(?:\.get)?\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\)", content
+        r"os\.(?:environ(?:\.get)?|getenv)\(['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\)", content
     ):
         mentions.add(m.group(1))
+    # os.environ['VAR'] and os.environ["VAR"]
     for m in re.finditer(
         r"os\.environ\[(['\"])([A-Za-z_][A-Za-z0-9_]*)\1\]", content
     ):
@@ -349,13 +399,11 @@ def _looks_like_secret(value: str) -> bool:
         "key-", "key_",
         "tok_", "token_",
     )
-    if any(lower.startswith(p) for p in secret_prefixes):
-        return True
-    if lower.startswith("bearer "):
-        return True
-    if re.fullmatch(r"[A-Za-z0-9+/=_-]{20,}", value):
-        return True
-    return False
+    return bool(
+        any(lower.startswith(p) for p in secret_prefixes)
+        or lower.startswith("bearer ")
+        or re.fullmatch(r"[A-Za-z0-9+/=_-]{20,}", value)
+    )
 
 
 def _unquote(value: str) -> str:
@@ -368,9 +416,38 @@ def _unquote(value: str) -> str:
 def _parse_mcp_from_yaml(yaml_path: Path) -> dict[str, dict[str, object]]:
     """Extract mcp_servers entries from config.yaml.
 
-    Lightweight line-based parser to avoid requiring PyYAML.
-    Handles the common Hermes config format.
+    Uses PyYAML when available for full nested-structure support.
+    Falls back to a line-based indent parser that handles env/headers
+    blocks by tracking nesting depth.
     """
+    # Try PyYAML first for robust parsing.
+    try:
+        import yaml  # noqa: F811
+
+        content = _safe_read(yaml_path)
+        if not content:
+            return {}
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            return {}
+        mcp = parsed.get("mcp_servers")
+        if not isinstance(mcp, dict):
+            return {}
+        # Normalise to plain dicts with string keys.
+        servers: dict[str, dict[str, object]] = {}
+        for name, config in mcp.items():
+            if isinstance(name, str) and isinstance(config, dict):
+                servers[name] = config
+        return servers
+    except (ImportError, Exception):  # noqa: BLE001
+        pass
+
+    # Fallback: indent-aware line-based parser.
+    return _parse_mcp_yaml_fallback(yaml_path)
+
+
+def _parse_mcp_yaml_fallback(yaml_path: Path) -> dict[str, dict[str, object]]:
+    """Line-based YAML parser with indent tracking for nested env/headers blocks."""
     content = _safe_read(yaml_path)
     if not content:
         return {}
@@ -379,7 +456,10 @@ def _parse_mcp_from_yaml(yaml_path: Path) -> dict[str, dict[str, object]]:
     lines = content.splitlines()
     in_mcp_section = False
     current_server: str | None = None
-    current_indent = 0
+    server_indent = 0
+    # Track which nested block we are inside (e.g. "env", "headers", "sampling").
+    nested_block: str | None = None
+    nested_indent = 0
 
     for line in lines:
         stripped = line.lstrip()
@@ -391,26 +471,67 @@ def _parse_mcp_from_yaml(yaml_path: Path) -> dict[str, dict[str, object]]:
         if stripped.startswith("mcp_servers:") and indent == 0:
             in_mcp_section = True
             current_server = None
+            nested_block = None
             continue
 
         if indent == 0 and in_mcp_section:
             in_mcp_section = False
             current_server = None
+            nested_block = None
             continue
 
         if not in_mcp_section:
             continue
 
+        # Server name line (indented once under mcp_servers).
         if indent <= 2 and stripped.endswith(":") and not stripped.startswith("-"):
             server_name = stripped.rstrip(":").strip()
             if server_name and server_name not in ("mcp_servers",):
                 current_server = server_name
-                current_indent = indent
+                server_indent = indent
                 servers[server_name] = {}
+                nested_block = None
             continue
 
-        if current_server and indent > current_indent:
-            _parse_yaml_property(stripped, servers[current_server])
+        if not current_server or indent <= server_indent:
+            nested_block = None
+            continue
+
+        # Check for nested block headers (env:, headers:, sampling:).
+        if stripped.endswith(":") and stripped.count(":") == 1:
+            block_name = stripped.rstrip(":").strip()
+            if block_name in ("env", "headers", "sampling"):
+                nested_block = block_name
+                nested_indent = indent
+                if block_name == "sampling":
+                    servers[current_server].setdefault("sampling", {})
+                else:
+                    servers[current_server].setdefault(block_name, {})
+                continue
+
+        # Inside a nested block (env/headers key: value pairs).
+        if nested_block and indent > nested_indent:
+            if nested_block in ("env", "headers"):
+                if ":" in stripped:
+                    k, _, v = stripped.partition(":")
+                    servers[current_server].setdefault(nested_block, {})[
+                        k.strip()
+                    ] = _unquote(v.strip())
+                continue
+            if nested_block == "sampling":
+                if ":" in stripped:
+                    k, _, v = stripped.partition(":")
+                    servers[current_server].setdefault("sampling", {})[
+                        k.strip()
+                    ] = _unquote(v.strip())
+                continue
+
+        # Exit nested block if indent drops back.
+        if nested_block and indent <= nested_indent:
+            nested_block = None
+
+        # Top-level server property.
+        _parse_yaml_property(stripped, servers[current_server])
 
     return servers
 
@@ -425,10 +546,6 @@ def _parse_yaml_property(line: str, target: dict[str, object]) -> None:
 
     if key in ("command", "url"):
         target[key] = _unquote(value)
-    elif key in ("enabled",) and value.lower() in ("true", "false"):
-        target.setdefault("sampling", {})[key] = value.lower() == "true"
-    elif key == "model" and "sampling" in target:
-        target["sampling"][key] = _unquote(value)
     elif key in ("args",) and value.startswith("["):
         try:
             parsed = json.loads(value)
