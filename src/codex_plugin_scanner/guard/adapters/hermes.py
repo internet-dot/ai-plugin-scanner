@@ -257,6 +257,11 @@ class HermesHarnessAdapter(HarnessAdapter):
             if not isinstance(name, str) or not isinstance(server_config, dict):
                 continue
 
+            # Skip disabled MCP servers unless explicitly enabled (default True).
+            enabled = server_config.get("enabled", True)
+            if enabled is False:
+                continue
+
             command = server_config.get("command")
             url = server_config.get("url")
             args = server_config.get("args", [])
