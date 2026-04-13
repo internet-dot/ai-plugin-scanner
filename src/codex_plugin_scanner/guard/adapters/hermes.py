@@ -673,10 +673,11 @@ def _parse_mcp_yaml_fallback(yaml_path: Path) -> dict[str, dict[str, object]]:
                     servers[current_server].setdefault("args", []).append(multiline_buffer.strip())
                 multiline_continue = False
                 multiline_buffer = ""
+                # Don't continue - let the dedented line be parsed below
             else:
                 # Collect continuation line
                 multiline_buffer += stripped + "\n"
-            continue
+                continue
 
         # Top-level server property.
         _parse_yaml_property(stripped, servers[current_server])
